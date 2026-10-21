@@ -1,0 +1,37 @@
+# Zotero LiveReload
+
+在 Zotero 原生 PDF 阅读器中预览远程 LaTeX 编译结果。默认地址为 `http://10.253.0.9:8765/main.pdf`。
+
+## 安装和使用
+
+下载 [zotero-livereload-0.1.0.xpi](dist/zotero-livereload-0.1.0.xpi)（在 GitHub 文件页点击 Download raw）。
+
+1. 打开 Zotero → 工具 → 插件，右上角齿轮 → 从文件安装插件，选择 `dist/zotero-livereload-0.1.0.xpi`。
+2. 工具 → PDF 实时预览 (LiveReload) → 打开 / 刷新远程 PDF。
+3. PDF 工具栏中点击“刷新 PDF”，或开启“自动刷新”。
+4. 用“地址”按钮或工具菜单中的“设置 PDF 地址…”修改来源。
+
+首次使用会在个人文献库创建一个独立的链接附件。文件保存在 Zotero 数据目录的 `livereload/` 内，不会替换其他已有附件。不同 URL 使用不同缓存文件。链接附件不参与 Zotero 文件同步。自动刷新默认关闭，开关会保存；仅在预览标签页或独立阅读窗口打开时轮询。
+
+每 2 秒以 HEAD 检查 ETag / Last-Modified / Content-Length，变化连续稳定两次后下载。通常在编译完成后约 2–4 秒加下载时间更新。服务器不支持 HEAD 或没有版本标头时退回 GET，并比较文件内容。手动刷新会立即下载。HTTP 请求超时为 15 秒，自动刷新失败后下次重试。
+
+下载内容必须具有 PDF 文件头及结尾标记，再通过临时文件替换缓存；网络失败和明显不完整的文件不会覆盖上一版。这是基本完整性检查，不替代 PDF 解析。服务器最好在编译成功后原子替换 `main.pdf`，避免向客户端提供编译中间文件。相同秒内修改且大小不变时，Last-Modified/长度可能无法识别，手动刷新可强制检查；可靠的 ETag 可改善检测。
+
+刷新复用 Zotero 原生 `reader.reload()`，阅读位置的保留行为由 Zotero 决定。修改排版可能导致已有批注偏移。工具栏通过阅读器事件注入；安装前已打开的 PDF 可能需要关闭再打开以显示按钮，工具菜单可直接使用。
+
+## 构建与验证
+
+需要 Node.js 和 Windows PowerShell，无 npm 依赖。
+
+```powershell
+npm test
+npm run build
+```
+
+`npm run smoke` 会启动隔离的 Zotero 测试配置，下载默认地址的 PDF，检查菜单、工具栏、页面渲染及原生重载，结束后关闭测试实例。结果写入 `.test-results/smoke.json`。使用独立的 `.test-profile/data`，不访问现有文献库；不要把测试实例的数据目录改成日常使用的目录。
+
+清单允许 Zotero 7–10；本机验证目标为 Zotero 10.0.6，其他版本尚未实机验证。原生阅读器内部属性集中在 `livereload.js`，后续 Zotero 更新可能需要适配。
+
+已通过 7 项自动化测试，并在 Zotero 10.0.6 的隔离配置中验证远程 PDF 下载、22 页文档渲染、工具栏及原生重载。
+
+当前通过 XPI 手动更新。Zotero 10 要求清单提供更新 URL，因此暂用保留域名 `example.invalid`，没有连接任何第三方更新服务；发布时应替换为自己的更新清单地址。

@@ -1,0 +1,10 @@
+{
+  "name": "zotero-livereload",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1"
+  }
+}
