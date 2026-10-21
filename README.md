@@ -4,7 +4,7 @@
 
 ## 安装和使用
 
-下载 [zotero-livereload-0.1.1.xpi](dist/zotero-livereload-0.1.1.xpi)（在 GitHub 文件页点击 Download raw）。
+从 [最新 Release](https://github.com/dyingjie/zotero-livereload/releases/latest) 下载 Assets 中的 `.xpi` 安装包。[查看更新记录](CHANGELOG.md)。
 
 1. 打开 Zotero → 工具 → 插件，右上角齿轮 → 从文件安装插件，选择 `dist/zotero-livereload-0.1.1.xpi`。
 2. 工具 → PDF 实时预览 (LiveReload) → 打开 / 刷新远程 PDF。
@@ -35,3 +35,12 @@ npm run build
 已通过自动化测试，并在 Zotero 10.0.6 的隔离配置中验证远程 PDF 下载、22 页文档渲染、真实工具栏按钮点击及原生重载。
 
 当前通过 XPI 手动更新。Zotero 10 要求清单提供更新 URL，因此暂用保留域名 `example.invalid`，没有连接任何第三方更新服务；发布时应替换为自己的更新清单地址。
+
+## 发布维护
+
+1. 同步修改 `manifest.json` 和 `package.json` 的版本号，并在 `CHANGELOG.md` 顶部增加对应版本的更新说明。
+2. 运行 `npm test`、`npm run build`；涉及阅读器行为时再运行本机 `npm run smoke`。
+3. 提交并推送代码，再创建和推送对应标签，例如 `git tag v0.1.2`、`git push origin v0.1.2`。
+4. GitHub Actions 自动检查版本一致性、运行测试、打包并创建 Release，附上 XPI 和更新说明。GitHub 托管环境不运行需要内网 PDF 服务的实机测试。
+
+每个发布标签对应固定版本，不移动已发布标签或覆盖已发布附件；修正应发布新版本。Release 页面用于下载发行包，Zotero 插件内自动升级尚未配置。
