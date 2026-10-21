@@ -8,6 +8,7 @@ var LiveReloadController = class {
     this.windows = new Map();
     this.controls = new Set();
     this.toolbarRoots = new Set();
+    this.refreshingReaders = new Set();
     this.stopped = false;
     this.busy = null;
     this.signature = null;
@@ -48,10 +49,15 @@ var LiveReloadController = class {
         this.controls.delete(control);
         continue;
       }
-      control.status.textContent = message;
-      control.auto.textContent = this.automatic ? "自动刷新：开" : "自动刷新：关";
-      control.auto.setAttribute("aria-pressed", String(this.automatic));
-      control.refresh.disabled = !!this.busy;
+      const updated = this.pref("updatedAt." + control.reader.itemID, "");
+      control.status.textContent = "更新时间：" + (updated
+        ? new Date(updated).toLocaleTimeString([], { hour12: false }) : "—");
+      control.status.title = updated ? new Date(updated).toLocaleString() : "尚未成功刷新";
+      const loading = (control.reader.itemID === this.itemID && !!this.busy)
+        || this.refreshingReaders.has(control.reader);
+      control.refresh.disabled = loading;
+      control.refresh.textContent = loading ? "刷新中…" : "刷新 PDF";
+      control.refresh.title = message;
     }
     for (const nodes of this.windows.values()) {
       nodes.auto.setAttribute("checked", String(this.automatic));
@@ -118,21 +124,36 @@ var LiveReloadController = class {
       root.append(node);
       return node;
     };
-    if (reader.itemID !== this.itemID) {
-      button("打开实时预览", () => this.openPreview());
-      append(root);
-      return;
-    }
-    const refresh = button("刷新 PDF", () => this.refresh(true));
-    const auto = button("", () => this.toggleAutomatic());
-    button("地址", () => this.configure(Zotero.getMainWindow()));
+    const refresh = button("刷新 PDF", () => this.refreshReader(reader));
     const status = doc.createElement("span");
     status.style.cssText = "max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
     root.append(status);
     root.title = this.url;
     append(root);
-    this.controls.add({ root, refresh, auto, status });
+    this.controls.add({ root, refresh, status, reader });
     this.report(this.status);
+  }
+
+  markUpdated(itemID) {
+    this.setPref("updatedAt." + itemID, new Date().toISOString());
+  }
+
+  async refreshReader(reader) {
+    if (reader.itemID === this.itemID) return this.refresh(true);
+    // Other PDFs reload their own file instead of opening an unrelated preview.
+    if (this.refreshingReaders.has(reader)) return;
+    this.refreshingReaders.add(reader);
+    this.report("正在刷新 PDF…");
+    try {
+      await reader._initPromise;
+      if (this.stopped) return;
+      await reader.reload();
+      this.markUpdated(reader.itemID);
+    }
+    finally {
+      this.refreshingReaders.delete(reader);
+      this.report(this.status);
+    }
   }
 
   async configure(win) {
@@ -215,8 +236,15 @@ var LiveReloadController = class {
     return (Zotero.Reader._readers || []).some(r => r.itemID === this.itemID);
   }
 
-  async request(method) {
-    return Zotero.HTTP.request(method, this.url, {
+  async request(method, force = false) {
+    // A unique GET URL bypasses intermediaries that ignore request cache headers.
+    let url = this.url;
+    if (force && method === "GET") {
+      const hashIndex = url.indexOf("#");
+      if (hashIndex !== -1) url = url.slice(0, hashIndex);
+      url += (url.includes("?") ? "&" : "?") + "_zlr=" + Date.now();
+    }
+    return Zotero.HTTP.request(method, url, {
       responseType: method === "GET" ? "arraybuffer" : "text",
       timeout: 15000,
       headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" }
@@ -232,7 +260,12 @@ var LiveReloadController = class {
 
   refresh(force) {
     if (this.stopped) return Promise.resolve();
-    if (this.busy) return this.busy;
+    if (this.busy) {
+      // A manual click must not get swallowed by an automatic metadata check.
+      if (force && !this.busyForced) return this.busy.then(() => this.refresh(true));
+      return this.busy;
+    }
+    this.busyForced = force;
     this.busy = this.performRefresh(force).finally(() => {
       this.busy = null;
       this.report(this.status);
@@ -243,7 +276,7 @@ var LiveReloadController = class {
 
   async performRefresh(force) {
     let head = null;
-    try { head = await this.request("HEAD"); }
+    try { if (!force) head = await this.request("HEAD"); }
     catch (error) {
       // Servers without HEAD support can still be refreshed with GET.
       if (![405, 501].includes(error.status)) throw error;
@@ -260,7 +293,7 @@ var LiveReloadController = class {
       }
       if (Date.now() - this.pendingAt < 1000) return;
     }
-    const response = await this.request("GET");
+    const response = await this.request("GET", force);
     if (this.stopped) return;
     const bytes = new Uint8Array(response.response);
     this.validatePDF(bytes);
@@ -290,6 +323,7 @@ var LiveReloadController = class {
         if (this.stopped) return;
         await reader.reload();
       }
+      this.markUpdated(item.id);
     }
     this.signature = downloadedSignature || signature;
     this.pendingSignature = null;

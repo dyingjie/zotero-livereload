@@ -47,7 +47,35 @@ async function startup(options) {
     await reader._initPromise;
     await Zotero.Promise.delay(3000);
     result.steps.push('reader-initialized');
-    await LiveReload.refresh(true);
+    const controls = Array.from(LiveReload.controls);
+    const control = controls.find(control => control.root.isConnected);
+    if (!control) throw new Error('LiveReload toolbar missing');
+    let clicks = 0;
+    let downloads = 0;
+    let reloads = 0;
+    const request = LiveReload.request.bind(LiveReload);
+    LiveReload.request = async (method, force) => {
+      if (method === 'GET') downloads++;
+      return request(method, force);
+    };
+    const reload = reader.reload.bind(reader);
+    reader.reload = async () => { reloads++; return reload(); };
+    control.refresh.addEventListener('click', () => clicks++);
+    result.buttonDisabled = control.refresh.disabled;
+    result.buttonNamespace = control.refresh.namespaceURI;
+    result.toolbarButtonCount = control.root.querySelectorAll('button').length;
+    result.updatedBefore = LiveReload.pref('updatedAt.' + reader.itemID, '');
+    control.refresh.click();
+    if (LiveReload.busy) await LiveReload.busy;
+    result.clicks = clicks;
+    result.downloads = downloads;
+    result.reloads = reloads;
+    result.updatedAfter = LiveReload.pref('updatedAt.' + reader.itemID, '');
+    result.timestampText = control.status.textContent;
+    if (downloads !== 1 || reloads !== 1) throw new Error('Toolbar click did not download and reload');
+    if (result.toolbarButtonCount !== 1 || !result.updatedAfter || result.updatedAfter === result.updatedBefore) {
+      throw new Error('Expected one refresh button and an advancing success timestamp');
+    }
     await Zotero.Promise.delay(2000);
     result.steps.push('native-reload');
     const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;

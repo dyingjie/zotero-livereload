@@ -66,7 +66,7 @@ test('first download creates preview; unchanged HEAD skips GET; manual refresh r
   await f.controller.refresh(true);
   assert.equal(f.writes, 1); assert.equal(f.reloads, 1);
   await f.controller.refresh(false);
-  assert.deepEqual(f.requests.map(r => r.method), ['HEAD', 'GET', 'HEAD']);
+  assert.deepEqual(f.requests.map(r => r.method), ['GET', 'HEAD']);
   await f.controller.refresh(true);
   assert.equal(f.writes, 1); assert.equal(f.reloads, 2);
 });
@@ -94,9 +94,42 @@ test('invalid and truncated responses and network failures preserve old PDF', as
 
 test('HEAD unsupported falls back to GET and overlapping refreshes share one request', async () => {
   const f = fixture(); await f.controller.start(); f.headStatus = 405;
-  const first = f.controller.refresh(true); const second = f.controller.refresh(true);
+  const first = f.controller.refresh(false); const second = f.controller.refresh(false);
   assert.equal(first, second); await first;
   assert.deepEqual(f.requests.map(r => r.method), ['HEAD', 'GET']);
+});
+
+test('manual refresh bypasses HEAD and HTTP caches and records a successful update time', async () => {
+  const f = fixture(); await f.controller.start(); f.headStatus = 403;
+  await f.controller.refresh(true);
+  assert.deepEqual(f.requests.map(r => r.method), ['GET']);
+  assert.match(f.requests[0].url, /main\.pdf\?_zlr=\d+$/);
+  const updated = f.controller.pref('updatedAt.1', '');
+  assert.ok(updated && !Number.isNaN(Date.parse(updated)));
+  f.fail = true;
+  await assert.rejects(f.controller.refresh(true), /offline/);
+  assert.equal(f.controller.pref('updatedAt.1', ''), updated);
+});
+
+test('manual click during automatic check still performs a forced GET', async () => {
+  const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
+  f.requests.length = 0;
+  const automatic = f.controller.refresh(false);
+  const manual = f.controller.refresh(true);
+  await Promise.all([automatic, manual]);
+  assert.deepEqual(f.requests.map(r => r.method), ['HEAD', 'GET']);
+  assert.match(f.requests[1].url, /_zlr=/);
+});
+
+test('refresh on another PDF reloads that reader without downloading the remote preview', async () => {
+  const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
+  f.requests.length = 0;
+  let reloads = 0;
+  const reader = { itemID: 99, _initPromise: Promise.resolve(), reload: async () => { reloads++; } };
+  await f.controller.refreshReader(reader);
+  assert.equal(reloads, 1);
+  assert.equal(f.requests.length, 0);
+  assert.ok(f.controller.pref('updatedAt.99', ''));
 });
 
 test('source URLs have separate caches; unrelated attachments are not reused', async () => {
