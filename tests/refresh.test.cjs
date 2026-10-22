@@ -21,12 +21,19 @@ function fixture() {
   let body = Buffer.from('%PDF-1.7\nfirst document\n%%EOF\n');
   let fail = false;
   let headStatus = 0;
-  const reader = { itemID: 1, _initPromise: Promise.resolve(), reload: async () => { reloads++; } };
+  const opened = [];
+  const reader = { itemID: 1, _initPromise: Promise.resolve(), _iframeWindow: {},
+    _internalReader: { reload: data => {
+      reloads++;
+      reader._internalReader._primaryView = { initializedPromise: Promise.resolve(),
+        _iframeWindow: { PDFViewerApplication: { pdfDocument: { getData: async () => data.buf } } } };
+    } } };
   let controller;
   const item = { id: 1, deleted: false, isAttachment: () => true, attachmentLinkMode: 2,
     getFilePathAsync: async () => controller.cachePath() };
   const context = vm.createContext({
     Uint8Array, Date, console,
+    Cu: { cloneInto: value => value },
     IOUtils: {
       makeDirectory: async () => {}, exists: async path => files.has(path),
       read: async path => files.get(path),
@@ -39,7 +46,7 @@ function fixture() {
       Prefs: { get: key => prefs.get(key), set: (key, value) => prefs.set(key, value) },
       DataDirectory: { dir: '/test' }, getMainWindows: () => [],
       Utilities: { Internal: { md5: value => crypto.createHash('md5').update(value).digest('hex') } },
-      Reader: { _readers: [reader], registerEventListener() {}, unregisterEventListener() {}, open: async () => reader },
+      Reader: { _readers: [reader], registerEventListener() {}, unregisterEventListener() {}, open: async id => { opened.push(id); return reader; } },
       Items: { getAsync: async () => item },
       Libraries: { userLibraryID: 1 },
       Attachments: { LINK_MODE_LINKED_FILE: 2, linkFromFile: async () => item },
@@ -55,7 +62,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync('livereload.js', 'utf8'), context);
   controller = new context.LiveReloadController('test');
-  return { controller, files, requests, reader, item,
+  return { controller, files, requests, reader, item, opened,
     get reloads() { return reloads; }, get writes() { return writes; },
     set version(value) { version = value; }, set body(value) { body = Buffer.from(value); },
     set fail(value) { fail = value; }, set headStatus(value) { headStatus = value; } };
@@ -121,15 +128,43 @@ test('manual click during automatic check still performs a forced GET', async ()
   assert.match(f.requests[1].url, /_zlr=/);
 });
 
-test('refresh on another PDF reloads that reader without downloading the remote preview', async () => {
+test('stale reader bytes reject refresh and do not advance successful update time', async () => {
+  const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
+  const updated = f.controller.pref('updatedAt.1', '');
+  // Reproduce a reader that continues returning the old document after reload.
+  f.reader._internalReader.reload = () => {};
+  f.body = '%PDF-1.7\nnew figure document\n%%EOF\n';
+  await assert.rejects(f.controller.refresh(true), /PDF.*不一致/);
+  assert.equal(f.controller.pref('updatedAt.1', ''), updated);
+});
+
+test('success timestamp waits until PDF reader data has been verified', async () => {
+  const f = fixture(); await f.controller.start();
+  let release;
+  f.reader._internalReader.reload = data => {
+    f.reader._internalReader._primaryView = { initializedPromise: Promise.resolve(),
+      _iframeWindow: { PDFViewerApplication: { pdfDocument: {
+        getData: () => new Promise(resolve => { release = () => resolve(data.buf); })
+      } } } };
+  };
+  const pending = f.controller.refresh(true);
+  for (let i = 0; i < 30 && !release; i++) await Promise.resolve();
+  assert.ok(release);
+  assert.equal(f.controller.pref('updatedAt.1', ''), '');
+  release(); await pending;
+  assert.ok(f.controller.pref('updatedAt.1', ''));
+});
+
+test('refresh on an old imported copy downloads remote PDF and focuses managed preview', async () => {
   const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
   f.requests.length = 0;
   let reloads = 0;
   const reader = { itemID: 99, _initPromise: Promise.resolve(), reload: async () => { reloads++; } };
   await f.controller.refreshReader(reader);
-  assert.equal(reloads, 1);
-  assert.equal(f.requests.length, 0);
-  assert.ok(f.controller.pref('updatedAt.99', ''));
+  assert.equal(reloads, 0);
+  assert.deepEqual(f.requests.map(request => request.method), ['GET']);
+  assert.deepEqual(f.opened, [1]);
+  assert.equal(f.controller.pref('updatedAt.99', ''), '');
 });
 
 test('source URLs have separate caches; unrelated attachments are not reused', async () => {

@@ -8,7 +8,6 @@ var LiveReloadController = class {
     this.windows = new Map();
     this.controls = new Set();
     this.toolbarRoots = new Set();
-    this.refreshingReaders = new Set();
     this.stopped = false;
     this.busy = null;
     this.signature = null;
@@ -49,15 +48,14 @@ var LiveReloadController = class {
         this.controls.delete(control);
         continue;
       }
-      const updated = this.pref("updatedAt." + control.reader.itemID, "");
+      const updated = this.pref("updatedAt." + this.itemID, "");
       control.status.textContent = "更新时间：" + (updated
         ? new Date(updated).toLocaleTimeString([], { hour12: false }) : "—");
       control.status.title = updated ? new Date(updated).toLocaleString() : "尚未成功刷新";
-      const loading = (control.reader.itemID === this.itemID && !!this.busy)
-        || this.refreshingReaders.has(control.reader);
+      const loading = !!this.busy;
       control.refresh.disabled = loading;
       control.refresh.textContent = loading ? "刷新中…" : "刷新 PDF";
-      control.refresh.title = message;
+      control.refresh.title = `${message}\n从 ${this.url} 下载最新版并显示实时预览`;
     }
     for (const nodes of this.windows.values()) {
       nodes.auto.setAttribute("checked", String(this.automatic));
@@ -140,20 +138,9 @@ var LiveReloadController = class {
 
   async refreshReader(reader) {
     if (reader.itemID === this.itemID) return this.refresh(true);
-    // Other PDFs reload their own file instead of opening an unrelated preview.
-    if (this.refreshingReaders.has(reader)) return;
-    this.refreshingReaders.add(reader);
-    this.report("正在刷新 PDF…");
-    try {
-      await reader._initPromise;
-      if (this.stopped) return;
-      await reader.reload();
-      this.markUpdated(reader.itemID);
-    }
-    finally {
-      this.refreshingReaders.delete(reader);
-      this.report(this.status);
-    }
+    // An imported copy may be stale. Always fetch the configured remote PDF and
+    // focus its managed preview rather than claiming that a local-only reload updated it.
+    await this.openPreview();
   }
 
   async configure(win) {
@@ -208,7 +195,40 @@ var LiveReloadController = class {
     await this.refresh(true);
     if (this.stopped) return;
     const item = await this.ensureItem();
-    await Zotero.Reader.open(item.id);
+    const wasOpen = (Zotero.Reader._readers || []).some(reader => reader.itemID === item.id);
+    const reader = await Zotero.Reader.open(item.id);
+    if (!wasOpen && reader && !this.stopped) {
+      await this.reloadReader(reader, await this.fs.io.read(this.cachePath()));
+      this.markUpdated(item.id);
+      this.report(this.status);
+    }
+  }
+
+  async reloadReader(reader, bytes) {
+    await reader._initPromise;
+    if (this.stopped) return;
+    const internal = reader._internalReader;
+    if (!internal?.reload) throw new Error("当前 Zotero 不支持直接刷新 PDF 数据");
+    // Passing freshly downloaded bytes avoids cached zotero://attachment responses.
+    // Clone a separate copy: PDF.js may transfer and detach its input buffer.
+    internal.reload(Cu.cloneInto({ buf: bytes.slice() }, reader._iframeWindow));
+    const verify = async () => {
+      const view = internal._primaryView;
+      await view.initializedPromise;
+      const app = view._iframeWindow.PDFViewerApplication;
+      if (!app.pdfDocument) await app.pdfLoadingTask.promise;
+      const loaded = Cu.cloneInto(await app.pdfDocument.getData(), {});
+      if (loaded.length !== bytes.length || !bytes.every((value, index) => value === loaded[index])) {
+        throw new Error("阅读器中的 PDF 与最新下载不一致，请重试刷新");
+      }
+    };
+    let timer;
+    try {
+      await Promise.race([verify(), new Promise((resolve, reject) => {
+        timer = this.timerAPI.setTimeout(() => reject(new Error("PDF 加载验证超时，请重试刷新")), 20000);
+      })]);
+    }
+    finally { this.timerAPI.clearTimeout(timer); }
   }
 
   async toggleAutomatic() {
@@ -317,13 +337,15 @@ var LiveReloadController = class {
     if (this.stopped) return;
     const item = await this.ensureItem();
     if (changed || force) {
+      let reloaded = false;
       for (const reader of (Zotero.Reader._readers || []).slice()) {
         if (reader.itemID !== item.id) continue;
         await reader._initPromise;
         if (this.stopped) return;
-        await reader.reload();
+        await this.reloadReader(reader, bytes);
+        reloaded = true;
       }
-      this.markUpdated(item.id);
+      if (reloaded) this.markUpdated(item.id);
     }
     this.signature = downloadedSignature || signature;
     this.pendingSignature = null;

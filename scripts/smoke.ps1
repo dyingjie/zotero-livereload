@@ -1,5 +1,5 @@
 # Uses a separate Zotero profile and data directory; never reads the user's library.
-param([switch]$DebugServer)
+param([switch]$DebugServer, [switch]$Fixture)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -32,13 +32,17 @@ $target = Join-Path $profile 'extensions/livereload@local.zotero.xpi'
 $stream = [IO.File]::Open($target, [IO.FileMode]::Create)
 $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create)
 $resultJSON = ConvertTo-Json (Join-Path $results 'smoke.json') -Compress
+$fixtureJS = $Fixture.IsPresent.ToString().ToLowerInvariant()
 $bootstrap = Get-Content -LiteralPath "$root/bootstrap.js" -Raw
 $bootstrap = $bootstrap.Replace('async function startup(', 'async function originalStartup(')
 $bootstrap += @"
 
 async function startup(options) {
   const result = { version: Zotero.version, steps: [] };
+  const fixture = $fixtureJS;
   try {
+    Zotero.Prefs.set('extensions.zotero.livereload.url', fixture
+      ? 'http://127.0.0.1:18765/main.pdf' : 'http://10.253.0.9:8765/main.pdf', true);
     await originalStartup(options);
     result.steps.push('startup');
     await LiveReload.openPreview();
@@ -47,8 +51,24 @@ async function startup(options) {
     await reader._initPromise;
     await Zotero.Promise.delay(3000);
     result.steps.push('reader-initialized');
+    let clickedReader = reader;
+    if (fixture) {
+      const oldApp = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
+      const oldBytes = Components.utils.cloneInto(await oldApp.pdfDocument.getData(), {});
+      result.textBefore = String.fromCharCode(...oldBytes).match(/Figure 1: (OLD|NEW)/)?.[0];
+      if (!result.textBefore.includes('Figure 1: OLD')) throw new Error('Expected OLD fixture');
+      const imported = await Zotero.Attachments.importFromFile({
+        file: LiveReload.cachePath(), libraryID: Zotero.Libraries.userLibraryID,
+        title: 'Old imported PDF regression'
+      });
+      clickedReader = await Zotero.Reader.open(imported.id);
+      await clickedReader._initPromise;
+      await Zotero.Promise.delay(1000);
+      await Zotero.HTTP.request('GET', 'http://127.0.0.1:18765/advance');
+      result.clickedImportedCopy = clickedReader.itemID !== LiveReload.itemID;
+    }
     const controls = Array.from(LiveReload.controls);
-    const control = controls.find(control => control.root.isConnected);
+    const control = controls.find(control => control.root.isConnected && control.reader === clickedReader);
     if (!control) throw new Error('LiveReload toolbar missing');
     let clicks = 0;
     let downloads = 0;
@@ -58,8 +78,8 @@ async function startup(options) {
       if (method === 'GET') downloads++;
       return request(method, force);
     };
-    const reload = reader.reload.bind(reader);
-    reader.reload = async () => { reloads++; return reload(); };
+    const reload = LiveReload.reloadReader.bind(LiveReload);
+    LiveReload.reloadReader = async (target, bytes) => { reloads++; return reload(target, bytes); };
     control.refresh.addEventListener('click', () => clicks++);
     result.buttonDisabled = control.refresh.disabled;
     result.buttonNamespace = control.refresh.namespaceURI;
@@ -79,6 +99,20 @@ async function startup(options) {
     await Zotero.Promise.delay(2000);
     result.steps.push('native-reload');
     const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
+    const renderedBytes = Components.utils.cloneInto(await app.pdfDocument.getData(), {});
+    const diskBytes = await IOUtils.read(LiveReload.cachePath());
+    const remoteBytes = new Uint8Array((await request('GET', true)).response);
+    const same = (left, right) => left.length === right.length && left.every((value, index) => value === right[index]);
+    result.readerMatchesDisk = same(renderedBytes, diskBytes);
+    result.readerMatchesServer = same(renderedBytes, remoteBytes);
+    if (!result.readerMatchesDisk || !result.readerMatchesServer) throw new Error('Reader is displaying stale PDF bytes');
+    if (fixture) {
+      result.textAfter = String.fromCharCode(...renderedBytes).match(/Figure 1: (OLD|NEW)/)?.[0];
+      result.focusedManagedPreview = Zotero.Reader.getByTabID(Zotero.getMainWindow().Zotero_Tabs.selectedID)?.itemID === LiveReload.itemID;
+      if (!result.textAfter.includes('Figure 1: NEW') || !result.focusedManagedPreview) {
+        throw new Error('Imported-copy refresh did not display the NEW remote fixture');
+      }
+    }
     result.pages = app.pdfDocument.numPages;
     result.renderedCanvases = app.pdfViewer._pages.filter(page => page.canvas?.width > 0).length;
     result.menu = !!Zotero.getMainWindow().document.getElementById('zotero-livereload-menu');
@@ -106,6 +140,13 @@ try {
 $arguments = @('-no-remote', '-profile', "`"$profile`"", '-ZoteroDebugText')
 if ($DebugServer) { $arguments += @('-start-debugger-server', '6100') }
 $startedAt = Get-Date
+if ($Fixture) {
+    if (Get-NetTCPConnection -LocalPort 18765 -State Listen -ErrorAction SilentlyContinue) { throw 'Fixture port 18765 is already in use.' }
+    $fixturePath = Join-Path $PSScriptRoot 'fixture-server.cjs'
+    $fixtureProcess = Start-Process -FilePath (Get-Command node).Source -ArgumentList @("`"$fixturePath`"") -WindowStyle Hidden -PassThru -RedirectStandardError "$results/fixture.log"
+    Start-Sleep -Milliseconds 600
+    if ($fixtureProcess.HasExited) { throw 'Fixture server failed to start.' }
+}
 $process = Start-Process -FilePath 'C:\Program Files\Zotero\zotero.exe' -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput "$results/stdout.log" -RedirectStandardError "$results/stderr.log"
 $process.Id | Set-Content -LiteralPath "$results/process-id.txt"
 Write-Output "Isolated Zotero PID: $($process.Id)"
@@ -128,4 +169,5 @@ try {
     Get-CimInstance Win32_Process -Filter "Name='zotero.exe'" |
         Where-Object { $_.CommandLine -like '*-profile*' -and $_.CommandLine.Contains($profile) } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
+    if ($fixtureProcess) { Stop-Process -Id $fixtureProcess.Id -ErrorAction SilentlyContinue }
 }

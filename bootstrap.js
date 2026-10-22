@@ -4,7 +4,7 @@
 var LiveReload;
 
 async function startup({ id, rootURI }) {
-  const scope = { Zotero, Services, ChromeUtils, IOUtils, PathUtils };
+  const scope = { Zotero, Services, ChromeUtils, IOUtils, PathUtils, Cu: Components.utils };
   Services.scriptloader.loadSubScript(rootURI + "livereload.js", scope);
   LiveReload = new scope.LiveReloadController(id);
   await LiveReload.start();
