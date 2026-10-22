@@ -1,6 +1,6 @@
 # Zotero LiveReload
 
-在 Zotero 原生 PDF 阅读器中预览远程 LaTeX 编译结果。默认地址为 `http://10.253.0.9:8765/main.pdf`。
+在 Zotero 原生 PDF 阅读器中实时预览 LaTeX 编译结果。默认地址为 `http://10.253.0.9:8765/main.pdf`。
 
 ## 安装和使用
 
