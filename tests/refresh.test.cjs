@@ -22,6 +22,8 @@ function fixture() {
   let fail = false;
   let headStatus = 0;
   const opened = [];
+  const timers = new Map();
+  let timerID = 0;
   const reader = { itemID: 1, _initPromise: Promise.resolve(), _iframeWindow: {},
     _internalReader: { reload: data => {
       reloads++;
@@ -40,11 +42,12 @@ function fixture() {
       write: async (path, bytes, options) => { assert.equal(options.tmpPath, path + '.tmp'); writes++; files.set(path, bytes.slice()); }
     },
     PathUtils: { join: (...parts) => parts.join('/') },
-    ChromeUtils: { importESModule: () => ({ setTimeout: () => 1, clearTimeout: () => {} }) },
+    ChromeUtils: { importESModule: () => ({ setTimeout: (fn, ms) => { timers.set(++timerID, { fn, ms }); return timerID; }, clearTimeout: id => timers.delete(id) }) },
     Services: {},
     Zotero: {
       Prefs: { get: key => prefs.get(key), set: (key, value) => prefs.set(key, value) },
       DataDirectory: { dir: '/test' }, getMainWindows: () => [],
+      getMainWindow: () => null, Promise: { delay: ms => new Promise(resolve => setTimeout(resolve, ms)) },
       Utilities: { Internal: { md5: value => crypto.createHash('md5').update(value).digest('hex') } },
       Reader: { _readers: [reader], registerEventListener() {}, unregisterEventListener() {}, open: async id => { opened.push(id); return reader; } },
       Items: { getAsync: async () => item },
@@ -62,7 +65,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync('livereload.js', 'utf8'), context);
   controller = new context.LiveReloadController('test');
-  return { controller, files, requests, reader, item, opened,
+  return { controller, files, requests, reader, item, opened, zotero: context.Zotero, timers,
     get reloads() { return reloads; }, get writes() { return writes; },
     set version(value) { version = value; }, set body(value) { body = Buffer.from(value); },
     set fail(value) { fail = value; }, set headStatus(value) { headStatus = value; } };
@@ -76,6 +79,58 @@ test('first download creates preview; unchanged HEAD skips GET; manual refresh r
   assert.deepEqual(f.requests.map(r => r.method), ['GET', 'HEAD']);
   await f.controller.refresh(true);
   assert.equal(f.writes, 1); assert.equal(f.reloads, 2);
+});
+
+test('open waits for a lazy restored reader even when Zotero.Reader.open returns undefined', async () => {
+  const f = fixture(); await f.controller.start();
+  f.zotero.Reader._readers = [];
+  let focused = 0;
+  f.reader.focus = async () => { focused++; };
+  f.zotero.Reader.open = async () => {
+    Promise.resolve().then(() => f.zotero.Reader._readers.push(f.reader));
+    return undefined;
+  };
+  assert.equal(await f.controller.openPreview(), f.reader);
+  assert.equal(focused, 1);
+  assert.equal(f.reloads, 1);
+});
+
+test('closed and uninitialized readers do not block opening a new preview', async () => {
+  const f = fixture(); await f.controller.start();
+  const closed = { itemID: 1, _isTabClosed: true, _initPromise: new Promise(() => {}) };
+  const pending = { itemID: 1, _initPromise: new Promise(() => {}) };
+  f.zotero.Reader._readers = [closed, pending];
+  f.zotero.Reader.open = async () => { f.zotero.Reader._readers.push(f.reader); return f.reader; };
+  assert.equal(await f.controller.openPreview(), f.reader);
+  assert.equal(f.reloads, 1);
+});
+
+test('reader initialization timeout releases busy state and late initialization cannot reload', async () => {
+  const f = fixture(); await f.controller.start();
+  let resolveInit;
+  f.reader._initPromise = new Promise(resolve => { resolveInit = resolve; });
+  const pending = f.controller.refresh(true);
+  for (let i = 0; i < 30 && !Array.from(f.timers.values()).some(t => t.ms === 20000); i++) await Promise.resolve();
+  const timeout = Array.from(f.timers.values()).find(t => t.ms === 20000);
+  assert.ok(timeout);
+  const rejection = assert.rejects(pending, /超时/);
+  timeout.fn(); await rejection;
+  assert.equal(f.controller.busy, null);
+  resolveInit(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.reloads, 0);
+});
+
+test('destroyed toolbar documents cannot break the open command or error reporting', async () => {
+  const f = fixture(); await f.controller.start();
+  const deadRoot = Object.defineProperty({}, 'isConnected', {
+    get() { throw new TypeError("can't access dead object"); }
+  });
+  f.controller.controls.add({ root: deadRoot });
+  f.controller.toolbarRoots.add(deadRoot);
+  assert.equal(await f.controller.openPreview(), f.reader);
+  assert.equal(f.controller.controls.size, 0);
+  assert.equal(f.controller.toolbarRoots.size, 0);
+  await f.controller.stop();
 });
 
 test('automatic update waits for stable metadata then replaces and reloads', async () => {

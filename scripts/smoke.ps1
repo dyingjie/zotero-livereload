@@ -38,12 +38,17 @@ $bootstrap = $bootstrap.Replace('async function startup(', 'async function origi
 $bootstrap += @"
 
 async function startup(options) {
+  await originalStartup(options);
+  // Exercise UI commands after startup/session restoration has completed.
+  Zotero.uiReadyPromise.then(() => Zotero.Promise.delay(250)).then(() => runSmoke(options));
+}
+
+async function runSmoke(options) {
   const result = { version: Zotero.version, steps: [] };
   const fixture = $fixtureJS;
   try {
     Zotero.Prefs.set('extensions.zotero.livereload.url', fixture
       ? 'http://127.0.0.1:18765/main.pdf' : 'http://10.253.0.9:8765/main.pdf', true);
-    await originalStartup(options);
     result.steps.push('startup');
     await LiveReload.openPreview();
     result.steps.push('download-and-open');
@@ -121,6 +126,24 @@ async function startup(options) {
     result.bytes = (await IOUtils.stat(LiveReload.cachePath())).size;
     result.status = LiveReload.status;
     result.ok = result.menu && result.toolbar > 0 && result.bytes > 0 && result.renderedCanvases > 0;
+    const win = Zotero.getMainWindow();
+    const tabs = win.Zotero_Tabs;
+    tabs.select(tabs._tabs[0].id);
+    tabs.unload(reader.tabID);
+    await Zotero.Promise.delay(300);
+    let opening;
+    const openPreview = LiveReload.openPreview.bind(LiveReload);
+    LiveReload.openPreview = () => { opening = openPreview(); return opening; };
+    win.document.getElementById('zotero-livereload-menu').querySelector('menuitem')
+      .doCommand();
+    await Zotero.Promise.delay(100);
+    if (!opening) throw new Error('Open menu command did not trigger');
+    const restored = await opening;
+    const restoredData = Components.utils.cloneInto(await restored._internalReader._primaryView._iframeWindow.PDFViewerApplication.pdfDocument.getData(), {});
+    result.unloadedTabRestored = restored.itemID === LiveReload.itemID && tabs.selectedID === restored.tabID;
+    result.restoredReaderMatchesServer = same(restoredData, remoteBytes);
+    if (!result.unloadedTabRestored || !result.restoredReaderMatchesServer) throw new Error('Unloaded preview was not restored and focused');
+    result.steps.push('menu-restores-unloaded-tab');
   } catch (error) {
     result.ok = false;
     result.error = String(error) + '\n' + error.stack;

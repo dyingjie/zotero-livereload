@@ -44,8 +44,9 @@ var LiveReloadController = class {
   report(message) {
     this.status = message;
     for (const control of this.controls) {
-      if (!control.root.isConnected) {
+      if (!this.isConnected(control.root)) {
         this.controls.delete(control);
+        this.toolbarRoots.delete(control.root);
         continue;
       }
       const updated = this.pref("updatedAt." + this.itemID, "");
@@ -59,7 +60,15 @@ var LiveReloadController = class {
     }
     for (const nodes of this.windows.values()) {
       nodes.auto.setAttribute("checked", String(this.automatic));
+      nodes.status.setAttribute("label", message);
     }
+  }
+
+  isConnected(node) {
+    // Unloading a Zotero reader destroys its document. Even reading isConnected
+    // on a retained node can throw "can't access dead object".
+    try { return node.isConnected; }
+    catch { return false; }
   }
 
   async action(fn, win = Zotero.getMainWindow()) {
@@ -94,9 +103,11 @@ var LiveReloadController = class {
     auto.setAttribute("autocheck", "false");
     auto.setAttribute("checked", String(this.automatic));
     add("设置 PDF 地址…", () => this.configure(win));
+    const status = add(this.status, () => {});
+    status.setAttribute("disabled", "true");
     add("查看状态", () => Zotero.alert(win, "Zotero LiveReload", `${this.url}\n${this.status}\n自动刷新：${this.automatic ? "开" : "关"}`));
     parent.append(menu);
-    this.windows.set(win, { menu, auto });
+    this.windows.set(win, { menu, auto, status });
   }
 
   removeWindow(win) {
@@ -109,7 +120,7 @@ var LiveReloadController = class {
     const root = doc.createElement("span");
     root.className = "zotero-livereload-controls";
     for (const node of this.toolbarRoots) {
-      if (!node.isConnected) this.toolbarRoots.delete(node);
+      if (!this.isConnected(node)) this.toolbarRoots.delete(node);
     }
     this.toolbarRoots.add(root);
     root.style.cssText = "display:inline-flex;align-items:center;gap:6px;margin-inline:6px;font-size:12px;";
@@ -192,27 +203,60 @@ var LiveReloadController = class {
   }
 
   async openPreview() {
+    const readyBefore = new Set(this.liveReaders().filter(reader => reader._internalReader));
     await this.refresh(true);
     if (this.stopped) return;
     const item = await this.ensureItem();
-    const wasOpen = (Zotero.Reader._readers || []).some(reader => reader.itemID === item.id);
-    const reader = await Zotero.Reader.open(item.id);
-    if (!wasOpen && reader && !this.stopped) {
+    this.report("正在打开 PDF 标签页…");
+    const reader = await this.withTimeout(async active => {
+      // Restoring an unloaded tab returns undefined. Selection triggers a second,
+      // asynchronous Reader.open(), so wait for that live reader instead.
+      let opened = await Zotero.Reader.open(item.id);
+      while (!opened && active() && !this.stopped) {
+        opened = this.liveReaders().find(candidate => candidate.itemID === item.id);
+        if (!opened) await Zotero.Promise.delay(50);
+      }
+      if (!active() || this.stopped) throw new Error("打开 PDF 已取消");
+      await opened._initPromise;
+      if (!active() || this.stopped) throw new Error("打开 PDF 已取消");
+      // Explicitly select the restored tab after initialization as well.
+      if (opened.tabID) {
+        const win = Zotero.getMainWindow();
+        win?.Zotero_Tabs?.select(opened.tabID);
+      }
+      await opened.focus?.();
+      return opened;
+    }, "PDF 标签页打开超时，请关闭该预览标签页后重试");
+    if (!readyBefore.has(reader) && !this.stopped) {
       await this.reloadReader(reader, await this.fs.io.read(this.cachePath()));
       this.markUpdated(item.id);
-      this.report(this.status);
     }
+    this.report("已打开 PDF " + new Date().toLocaleTimeString());
+    return reader;
+  }
+
+  async withTimeout(operation, message) {
+    let timer;
+    let active = true;
+    try {
+      return await Promise.race([operation(() => active), new Promise((resolve, reject) => {
+        timer = this.timerAPI.setTimeout(() => {
+          active = false;
+          reject(new Error(message));
+        }, 20000);
+      })]);
+    }
+    finally { active = false; this.timerAPI.clearTimeout(timer); }
   }
 
   async reloadReader(reader, bytes) {
-    await reader._initPromise;
-    if (this.stopped) return;
-    const internal = reader._internalReader;
-    if (!internal?.reload) throw new Error("当前 Zotero 不支持直接刷新 PDF 数据");
-    // Passing freshly downloaded bytes avoids cached zotero://attachment responses.
-    // Clone a separate copy: PDF.js may transfer and detach its input buffer.
-    internal.reload(Cu.cloneInto({ buf: bytes.slice() }, reader._iframeWindow));
-    const verify = async () => {
+    return this.withTimeout(async active => {
+      await reader._initPromise;
+      if (!active() || this.stopped) throw new Error("PDF 刷新已取消");
+      const internal = reader._internalReader;
+      if (!internal?.reload) throw new Error("当前 Zotero 不支持直接刷新 PDF 数据");
+      // Clone a separate copy: PDF.js may transfer and detach its input buffer.
+      internal.reload(Cu.cloneInto({ buf: bytes.slice() }, reader._iframeWindow));
       const view = internal._primaryView;
       await view.initializedPromise;
       const app = view._iframeWindow.PDFViewerApplication;
@@ -221,14 +265,7 @@ var LiveReloadController = class {
       if (loaded.length !== bytes.length || !bytes.every((value, index) => value === loaded[index])) {
         throw new Error("阅读器中的 PDF 与最新下载不一致，请重试刷新");
       }
-    };
-    let timer;
-    try {
-      await Promise.race([verify(), new Promise((resolve, reject) => {
-        timer = this.timerAPI.setTimeout(() => reject(new Error("PDF 加载验证超时，请重试刷新")), 20000);
-      })]);
-    }
-    finally { this.timerAPI.clearTimeout(timer); }
+    }, "PDF 加载验证超时，请关闭预览标签页后重试");
   }
 
   async toggleAutomatic() {
@@ -253,7 +290,12 @@ var LiveReloadController = class {
   }
 
   hasOpenReader() {
-    return (Zotero.Reader._readers || []).some(r => r.itemID === this.itemID);
+    return this.liveReaders().some(reader => reader._internalReader);
+  }
+
+  liveReaders() {
+    return (Zotero.Reader._readers || []).filter(reader => reader.itemID === this.itemID
+      && !reader._isTabClosed && !reader._isUninitialized);
   }
 
   async request(method, force = false) {
@@ -338,9 +380,9 @@ var LiveReloadController = class {
     const item = await this.ensureItem();
     if (changed || force) {
       let reloaded = false;
-      for (const reader of (Zotero.Reader._readers || []).slice()) {
-        if (reader.itemID !== item.id) continue;
-        await reader._initPromise;
+      for (const reader of this.liveReaders()) {
+        // Background/lazy readers must be selected before waiting for initialization.
+        if (!reader._internalReader) continue;
         if (this.stopped) return;
         await this.reloadReader(reader, bytes);
         reloaded = true;
@@ -369,7 +411,9 @@ var LiveReloadController = class {
     // In-flight HTTP requests have a finite timeout and check stopped before writing.
     if (this.busy) await this.busy.catch(() => {});
     for (const win of Array.from(this.windows.keys())) this.removeWindow(win);
-    for (const root of this.toolbarRoots) root.remove();
+    for (const root of this.toolbarRoots) {
+      if (this.isConnected(root)) root.remove();
+    }
     this.toolbarRoots.clear();
     this.controls.clear();
   }
