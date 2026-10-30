@@ -210,16 +210,41 @@ test('success timestamp waits until PDF reader data has been verified', async ()
   assert.ok(f.controller.pref('updatedAt.1', ''));
 });
 
-test('refresh on an old imported copy downloads remote PDF and focuses managed preview', async () => {
+test('unrelated PDFs do not download or open the configured preview', async () => {
   const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
   f.requests.length = 0;
   let reloads = 0;
   const reader = { itemID: 99, _initPromise: Promise.resolve(), reload: async () => { reloads++; } };
   await f.controller.refreshReader(reader);
   assert.equal(reloads, 0);
-  assert.deepEqual(f.requests.map(request => request.method), ['GET']);
-  assert.deepEqual(f.opened, [1]);
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(f.opened, []);
   assert.equal(f.controller.pref('updatedAt.99', ''), '');
+});
+
+test('toolbar injection ignores ordinary PDFs and previews from another source', async () => {
+  const f = fixture(); await f.controller.start();
+  const doc = { createElement() { throw new Error('Must not touch ordinary PDF UI'); } };
+  const append = () => { throw new Error('Must not inject toolbar'); };
+  f.controller.addToolbar({ reader: { type: 'pdf', itemID: 99 }, doc, append });
+  await f.controller.refresh(true);
+  f.controller.addToolbar({ reader: { type: 'pdf', itemID: 99 }, doc, append });
+  f.controller.setPref('itemID', 2);
+  f.controller.addToolbar({ reader: { type: 'pdf', itemID: 1 }, doc, append });
+  assert.equal(f.controller.controls.size, 0);
+});
+
+test('changing PDF source removes controls belonging to the previous preview', async () => {
+  const f = fixture(); await f.controller.start(); await f.controller.refresh(true);
+  let removed = 0;
+  const root = { isConnected: true, remove() { removed++; this.isConnected = false; } };
+  f.controller.controls.add({ root, reader: f.reader });
+  f.controller.toolbarRoots.add(root);
+  f.controller.setPref('itemID', 2);
+  f.controller.report('source changed');
+  assert.equal(removed, 1);
+  assert.equal(f.controller.controls.size, 0);
+  assert.equal(f.controller.toolbarRoots.size, 0);
 });
 
 test('source URLs have separate caches; unrelated attachments are not reused', async () => {

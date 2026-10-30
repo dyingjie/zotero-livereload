@@ -44,7 +44,8 @@ var LiveReloadController = class {
   report(message) {
     this.status = message;
     for (const control of this.controls) {
-      if (!this.isConnected(control.root)) {
+      if (!this.isConnected(control.root) || control.reader.itemID !== this.itemID) {
+        if (this.isConnected(control.root)) control.root.remove();
         this.controls.delete(control);
         this.toolbarRoots.delete(control.root);
         continue;
@@ -116,7 +117,7 @@ var LiveReloadController = class {
   }
 
   addToolbar({ reader, doc, append }) {
-    if (reader.type !== "pdf" || this.stopped) return;
+    if (reader.type !== "pdf" || this.stopped || !this.itemID || reader.itemID !== this.itemID) return;
     const root = doc.createElement("span");
     root.className = "zotero-livereload-controls";
     for (const node of this.toolbarRoots) {
@@ -149,9 +150,6 @@ var LiveReloadController = class {
 
   async refreshReader(reader) {
     if (reader.itemID === this.itemID) return this.refresh(true);
-    // An imported copy may be stale. Always fetch the configured remote PDF and
-    // focus its managed preview rather than claiming that a local-only reload updated it.
-    await this.openPreview();
   }
 
   async configure(win) {

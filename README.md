@@ -8,7 +8,7 @@
 
 1. 打开 Zotero → 工具 → 插件，右上角齿轮 → 从文件安装插件，选择下载的 `.xpi`。
 2. 工具 → PDF 实时预览 (LiveReload) → 打开 / 刷新远程 PDF。
-3. PDF 顶部只显示“刷新 PDF”和上次成功刷新时间。按钮始终下载配置地址的远程 PDF；如果当前是旧的普通导入副本，会切换到 LiveReload 预览，不覆盖原附件。
+3. 仅 LiveReload 专用预览附件顶部显示“刷新 PDF”和上次成功刷新时间，普通 PDF 文献不显示插件控件。按钮下载配置地址的远程 PDF。需要打开预览时使用工具菜单。
 4. 自动刷新开关及“设置 PDF 地址…”放在工具 → PDF 实时预览菜单中。
 
 首次使用会在个人文献库创建一个独立的链接附件。文件保存在 Zotero 数据目录的 `livereload/` 内，不会替换其他已有附件。不同 URL 使用不同缓存文件。链接附件不参与 Zotero 文件同步。自动刷新默认关闭，开关会保存；仅在预览标签页或独立阅读窗口打开时轮询。
@@ -30,7 +30,7 @@ npm run build
 
 `npm run smoke` 会启动隔离的 Zotero 测试配置，下载默认地址的 PDF，检查菜单、工具栏、页面渲染及原生重载，结束后关闭测试实例。结果写入 `.test-results/smoke.json`。使用独立的 `.test-profile/data`，不访问现有文献库；不要把测试实例的数据目录改成日常使用的目录。
 
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Fixture` 运行本地可重复的内容回归：服务器从 OLD 切换到 NEW（文件长度和修改时间相同），点击旧导入副本的按钮，确认切换到预览且阅读器实际数据、缓存、服务器一致。
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Fixture` 运行本地可重复的内容回归：检查普通 PDF 没有插件工具栏；服务器从 OLD 切换到 NEW（文件长度和修改时间相同），点击专用预览中的按钮，确认阅读器实际数据、缓存、服务器一致。
 
 实机测试还会卸载后台预览标签页，再通过工具菜单的打开命令恢复并切到前台，核对恢复后加载的数据。打开标签页和加载验证均有 20 秒超时，工具菜单显示当前操作状态。
 

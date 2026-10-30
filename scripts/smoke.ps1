@@ -69,8 +69,11 @@ async function runSmoke(options) {
       clickedReader = await Zotero.Reader.open(imported.id);
       await clickedReader._initPromise;
       await Zotero.Promise.delay(1000);
+      result.ordinaryPDFHasNoToolbar = !clickedReader._iframeWindow.document.querySelector('.zotero-livereload-controls');
+      if (!result.ordinaryPDFHasNoToolbar) throw new Error('Toolbar leaked into ordinary PDF');
+      await Zotero.Reader.open(reader.itemID);
+      clickedReader = reader;
       await Zotero.HTTP.request('GET', 'http://127.0.0.1:18765/advance');
-      result.clickedImportedCopy = clickedReader.itemID !== LiveReload.itemID;
     }
     const controls = Array.from(LiveReload.controls);
     const control = controls.find(control => control.root.isConnected && control.reader === clickedReader);
@@ -115,7 +118,7 @@ async function runSmoke(options) {
       result.textAfter = String.fromCharCode(...renderedBytes).match(/Figure 1: (OLD|NEW)/)?.[0];
       result.focusedManagedPreview = Zotero.Reader.getByTabID(Zotero.getMainWindow().Zotero_Tabs.selectedID)?.itemID === LiveReload.itemID;
       if (!result.textAfter.includes('Figure 1: NEW') || !result.focusedManagedPreview) {
-        throw new Error('Imported-copy refresh did not display the NEW remote fixture');
+        throw new Error('Managed preview did not display the NEW remote fixture');
       }
     }
     result.pages = app.pdfDocument.numPages;
