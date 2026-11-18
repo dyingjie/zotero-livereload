@@ -9,10 +9,7 @@ var LiveReloadController = class {
     this.controls = new Set();
     this.toolbarRoots = new Set();
     this.stopped = false;
-    this.busy = null;
-    this.signature = null;
-    this.pendingSignature = null;
-    this.pendingAt = 0;
+    this.sources = new Map();
     this.status = "就绪";
     this.timerAPI = ChromeUtils.importESModule("resource://gre/modules/Timer.sys.mjs");
     this.fs = {};
@@ -29,13 +26,26 @@ var LiveReloadController = class {
     Zotero.Prefs.set(this.prefix + name, value, true);
   }
 
-  get url() { return this.pref("url", "http://10.253.0.9:8765/main.pdf"); }
   get automatic() { return this.pref("automatic", false); }
-  get itemID() { return this.pref("itemID", 0); }
+
+  get previews() {
+    return this.urls.map(url => {
+      if (!this.sources.has(url)) this.sources.set(url, new LiveReloadSource(this, url));
+      return this.sources.get(url);
+    });
+  }
 
   async start() {
     this.directory = this.fs.path.join(Zotero.DataDirectory.dir, "livereload");
     await this.fs.io.makeDirectory(this.directory, { ignoreExisting: true });
+    const legacyURL = this.pref("url", "http://10.253.0.9:8765/main.pdf");
+    const saved = this.pref("urls", "");
+    this.urls = saved ? JSON.parse(saved) : [legacyURL];
+    if (!saved) {
+      const legacyID = this.pref("itemID", 0);
+      if (legacyID) this.previews[0].itemID = legacyID;
+      this.setPref("urls", JSON.stringify(this.urls));
+    }
     Zotero.Reader.registerEventListener("renderToolbar", this.onToolbar, this.pluginID);
     for (const win of Zotero.getMainWindows()) this.addWindow(win);
     this.schedule();
@@ -44,20 +54,22 @@ var LiveReloadController = class {
   report(message) {
     this.status = message;
     for (const control of this.controls) {
-      if (!this.isConnected(control.root) || control.reader.itemID !== this.itemID) {
+      const source = control.source;
+      if (!this.isConnected(control.root) || control.reader.itemID !== source.itemID) {
         if (this.isConnected(control.root)) control.root.remove();
         this.controls.delete(control);
         this.toolbarRoots.delete(control.root);
         continue;
       }
-      const updated = this.pref("updatedAt." + this.itemID, "");
+      control.root.style.display = this.urls.includes(source.url) ? "inline-flex" : "none";
+      const updated = this.pref("updatedAt." + source.itemID, "");
       control.status.textContent = "更新时间：" + (updated
         ? new Date(updated).toLocaleTimeString([], { hour12: false }) : "—");
       control.status.title = updated ? new Date(updated).toLocaleString() : "尚未成功刷新";
-      const loading = !!this.busy;
+      const loading = !!source.busy;
       control.refresh.disabled = loading;
       control.refresh.textContent = loading ? "刷新中…" : "刷新 PDF";
-      control.refresh.title = `${message}\n从 ${this.url} 下载最新版并显示实时预览`;
+      control.refresh.title = `${source.status}\n从 ${source.url} 下载最新版并显示实时预览`;
     }
     for (const nodes of this.windows.values()) {
       nodes.auto.setAttribute("checked", String(this.automatic));
@@ -72,11 +84,13 @@ var LiveReloadController = class {
     catch { return false; }
   }
 
-  async action(fn, win = Zotero.getMainWindow()) {
+  async action(fn, win = Zotero.getMainWindow(), source) {
     try { return await fn(); }
     catch (error) {
       Zotero.logError(error);
-      this.report("刷新失败：" + error.message);
+      const message = "操作失败：" + error.message;
+      if (source) source.report(message);
+      else this.report(message);
       Zotero.alert(win, "Zotero LiveReload", error.message);
     }
   }
@@ -98,15 +112,20 @@ var LiveReloadController = class {
       popup.append(item);
       return item;
     };
-    add("打开 / 刷新远程 PDF", () => this.openPreview());
-    const auto = add("自动刷新（每 2 秒检查）", () => this.toggleAutomatic());
+    add("打开 / 刷新远程 PDF", () => this.openPreview(win));
+    add("打开 / 刷新所有远程 PDF", () => this.openAll(win));
+    const auto = add("自动刷新（每 2 秒检查）", () => this.toggleAutomatic(win));
     auto.setAttribute("type", "checkbox");
     auto.setAttribute("autocheck", "false");
     auto.setAttribute("checked", String(this.automatic));
-    add("设置 PDF 地址…", () => this.configure(win));
+    add("添加 PDF 地址…", () => this.addAddress(win));
+    add("移除 PDF 地址…", () => this.removeAddress(win));
     const status = add(this.status, () => {});
     status.setAttribute("disabled", "true");
-    add("查看状态", () => Zotero.alert(win, "Zotero LiveReload", `${this.url}\n${this.status}\n自动刷新：${this.automatic ? "开" : "关"}`));
+    add("查看状态", () => {
+      const details = this.previews.map(source => `${source.url}\n${source.status}`).join("\n\n");
+      Zotero.alert(win, "Zotero LiveReload", `自动刷新：${this.automatic ? "开" : "关"}\n\n${details || "尚未配置 PDF 地址"}`);
+    });
     parent.append(menu);
     this.windows.set(win, { menu, auto, status });
   }
@@ -117,64 +136,159 @@ var LiveReloadController = class {
   }
 
   addToolbar({ reader, doc, append }) {
-    if (reader.type !== "pdf" || this.stopped || !this.itemID || reader.itemID !== this.itemID) return;
+    if (reader.type !== "pdf" || this.stopped) return;
+    const source = this.previews.find(candidate => candidate.itemID && candidate.itemID === reader.itemID);
+    if (!source) return;
     const root = doc.createElement("span");
     root.className = "zotero-livereload-controls";
     for (const node of this.toolbarRoots) {
       if (!this.isConnected(node)) this.toolbarRoots.delete(node);
     }
     this.toolbarRoots.add(root);
-    root.style.cssText = "display:inline-flex;align-items:center;gap:6px;margin-inline:6px;font-size:12px;";
+    root.style.cssText = "align-items:center;gap:6px;margin-inline:6px;font-size:12px;";
     const button = (text, fn) => {
       const node = doc.createElement("button");
       node.type = "button";
       node.textContent = text;
       node.style.cssText = "font:inherit;padding:3px 7px;cursor:pointer;white-space:nowrap;";
-      node.addEventListener("click", () => this.action(fn));
+      node.addEventListener("click", () => this.action(fn, undefined, source));
       root.append(node);
       return node;
     };
-    const refresh = button("刷新 PDF", () => this.refreshReader(reader));
+    const refresh = button("刷新 PDF", () => {
+      if (this.urls.includes(source.url)) return source.refresh(true);
+    });
     const status = doc.createElement("span");
     status.style.cssText = "max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
     root.append(status);
-    root.title = this.url;
+    root.title = source.url;
     append(root);
-    this.controls.add({ root, refresh, status, reader });
+    this.controls.add({ root, refresh, status, reader, source });
     this.report(this.status);
   }
 
-  markUpdated(itemID) {
-    this.setPref("updatedAt." + itemID, new Date().toISOString());
+  choosePreview(win, title, alwaysChoose = false) {
+    const previews = this.previews;
+    if (!previews.length) throw new Error("请先添加 PDF 地址");
+    if (previews.length === 1 && !alwaysChoose) return previews[0];
+    const selected = { value: 0 };
+    const labels = previews.map(source => source.url);
+    if (Services.prompt.select(win, "Zotero LiveReload", title, labels, selected)) {
+      return previews[selected.value];
+    }
   }
 
-  async refreshReader(reader) {
-    if (reader.itemID === this.itemID) return this.refresh(true);
+  async openPreview(win) {
+    const source = this.choosePreview(win, "选择要打开或刷新的 PDF");
+    if (source) return this.action(() => source.openPreview(), win, source);
   }
 
-  async configure(win) {
-    // Finish a running replacement before changing which source owns the cache.
-    if (this.busy) await this.busy;
-    const input = { value: this.url };
-    if (!Services.prompt.prompt(win, "远程 PDF 地址", "输入 HTTP / HTTPS PDF 地址", input, null, {})) return;
-    const value = input.value.trim();
-    const uri = Services.io.newURI(value);
+  async openAll(win) {
+    if (!this.urls.length) throw new Error("请先添加 PDF 地址");
+    // Open tabs sequentially to avoid competing for tab selection during restoration.
+    for (const source of this.previews) {
+      if (this.stopped) break;
+      if (!this.urls.includes(source.url)) continue;
+      await this.action(() => source.openPreview(), win, source);
+    }
+  }
+
+  async addAddress(win) {
+    const input = { value: "" };
+    if (!Services.prompt.prompt(win, "添加远程 PDF", "输入 HTTP / HTTPS PDF 地址", input, null, {})) return;
+    const url = input.value.trim();
+    let uri;
+    try { uri = Services.io.newURI(url); }
+    catch { throw new Error("请输入有效的 HTTP 或 HTTPS 地址"); }
     if (!["http", "https"].includes(uri.scheme) || !uri.host) {
       throw new Error("请输入有效的 HTTP 或 HTTPS 地址");
     }
-    if (value !== this.url) {
-      this.setPref("url", value);
-      this.setPref("itemID", 0);
-      this.signature = null;
-      this.pendingSignature = null;
+    if (!this.urls.includes(url)) this.saveURLs([...this.urls, url]);
+    const source = this.previews.find(candidate => candidate.url === url);
+    return this.action(() => source.openPreview(), win, source);
+  }
+
+  removeAddress(win) {
+    const source = this.choosePreview(win, "选择要从列表移除的 PDF 地址", true);
+    if (!source) return;
+    this.saveURLs(this.urls.filter(url => url !== source.url));
+    this.report("已移除 PDF 地址");
+  }
+
+  saveURLs(urls) {
+    this.setPref("urls", JSON.stringify(urls));
+    this.urls = urls;
+  }
+
+  async toggleAutomatic(win) {
+    this.setPref("automatic", !this.automatic);
+    this.report(this.automatic ? "自动刷新已开启" : "自动刷新已暂停");
+    if (this.automatic && this.urls.length === 1 && !this.previews[0].hasOpenReader()) {
+      await this.openPreview(win);
     }
-    await this.openPreview();
+  }
+
+  schedule() {
+    if (this.stopped) return;
+    this.timer = this.timerAPI.setTimeout(() => {
+      if (this.automatic) {
+        for (const source of this.previews) {
+          if (source.busy || !source.hasOpenReader()) continue;
+          source.refresh(false).catch(error => {
+            Zotero.logError(error);
+            source.report("连接失败，稍后重试：" + error.message);
+          });
+        }
+      }
+      this.schedule();
+    }, 2000);
+  }
+
+  async stop() {
+    this.stopped = true;
+    this.timerAPI.clearTimeout(this.timer);
+    Zotero.Reader.unregisterEventListener("renderToolbar", this.onToolbar);
+    // In-flight HTTP requests have a finite timeout and check stopped before writing.
+    await Promise.allSettled(Array.from(this.sources.values(), source => source.busy));
+    for (const win of Array.from(this.windows.keys())) this.removeWindow(win);
+    for (const root of this.toolbarRoots) {
+      if (this.isConnected(root)) root.remove();
+    }
+    this.toolbarRoots.clear();
+    this.controls.clear();
+  }
+};
+
+class LiveReloadSource {
+  constructor(controller, url) {
+    this.controller = controller;
+    this.url = url;
+    this.hash = Zotero.Utilities.Internal.md5(url);
+    this.fs = controller.fs;
+    this.timerAPI = controller.timerAPI;
+    this.busy = null;
+    this.signature = null;
+    this.pendingSignature = null;
+    this.pendingAt = 0;
+    this.status = "就绪";
+  }
+
+  get stopped() { return this.controller.stopped; }
+  get itemID() { return this.controller.pref("itemID." + this.hash, 0); }
+  set itemID(id) { this.controller.setPref("itemID." + this.hash, id); }
+
+  report(message) {
+    this.status = message;
+    this.controller.report(message);
+  }
+
+  markUpdated(itemID) {
+    this.controller.setPref("updatedAt." + itemID, new Date().toISOString());
   }
 
   cachePath() {
     // Stable source-specific path; changing URLs never overwrites another preview.
-    const hash = Zotero.Utilities.Internal.md5(this.url);
-    return this.fs.path.join(this.directory, hash + ".pdf");
+    return this.fs.path.join(this.controller.directory, this.hash + ".pdf");
   }
 
   async getItem() {
@@ -195,7 +309,7 @@ var LiveReloadController = class {
         contentType: "application/pdf",
         libraryID: Zotero.Libraries.userLibraryID
       });
-      this.setPref("itemID", item.id);
+      this.itemID = item.id;
     }
     return item;
   }
@@ -204,7 +318,8 @@ var LiveReloadController = class {
     const readyBefore = new Set(this.liveReaders().filter(reader => reader._internalReader));
     await this.refresh(true);
     if (this.stopped) return;
-    const item = await this.ensureItem();
+    const item = await this.getItem();
+    if (!item) throw new Error("找不到刚刷新的 PDF 附件，请重试");
     this.report("正在打开 PDF 标签页…");
     const reader = await this.withTimeout(async active => {
       // Restoring an unloaded tab returns undefined. Selection triggers a second,
@@ -266,27 +381,6 @@ var LiveReloadController = class {
     }, "PDF 加载验证超时，请关闭预览标签页后重试");
   }
 
-  async toggleAutomatic() {
-    this.setPref("automatic", !this.automatic);
-    this.report(this.automatic ? "自动刷新已开启" : "自动刷新已暂停");
-    if (this.automatic) await this.openPreview();
-  }
-
-  schedule() {
-    if (this.stopped) return;
-    this.timer = this.timerAPI.setTimeout(async () => {
-      try {
-        // Only poll while this preview is actually open, including detached windows.
-        if (this.automatic && this.hasOpenReader()) await this.refresh(false);
-      }
-      catch (error) {
-        Zotero.logError(error);
-        this.report("连接失败，稍后重试：" + error.message);
-      }
-      finally { this.schedule(); }
-    }, 2000);
-  }
-
   hasOpenReader() {
     return this.liveReaders().some(reader => reader._internalReader);
   }
@@ -322,7 +416,9 @@ var LiveReloadController = class {
     if (this.stopped) return Promise.resolve();
     if (this.busy) {
       // A manual click must not get swallowed by an automatic metadata check.
-      if (force && !this.busyForced) return this.busy.then(() => this.refresh(true));
+      if (force && !this.busyForced) return this.busy.then(
+        () => this.refresh(true), () => this.refresh(true)
+      );
       return this.busy;
     }
     this.busyForced = force;
@@ -402,17 +498,4 @@ var LiveReloadController = class {
     }
   }
 
-  async stop() {
-    this.stopped = true;
-    this.timerAPI.clearTimeout(this.timer);
-    Zotero.Reader.unregisterEventListener("renderToolbar", this.onToolbar);
-    // In-flight HTTP requests have a finite timeout and check stopped before writing.
-    if (this.busy) await this.busy.catch(() => {});
-    for (const win of Array.from(this.windows.keys())) this.removeWindow(win);
-    for (const root of this.toolbarRoots) {
-      if (this.isConnected(root)) root.remove();
-    }
-    this.toolbarRoots.clear();
-    this.controls.clear();
-  }
 };

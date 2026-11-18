@@ -29,8 +29,8 @@ const server = http.createServer((request, response) => {
   if (route === '/advance') {
     version = 'NEW'; response.end('ok'); return;
   }
-  if (route !== '/main.pdf') { response.writeHead(404).end(); return; }
-  const bytes = pdf(version);
+  if (route !== '/main.pdf' && route !== '/other.pdf') { response.writeHead(404).end(); return; }
+  const bytes = pdf(route === '/main.pdf' ? version : 'OTHER');
   response.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': bytes.length,
     // Intentionally keep timestamps and size unchanged: forced refresh must fetch bytes.
     'Last-Modified': 'Wed, 21 Oct 2026 00:00:00 GMT', 'Cache-Control': 'max-age=3600' });

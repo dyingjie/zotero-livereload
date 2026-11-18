@@ -47,12 +47,13 @@ async function runSmoke(options) {
   const result = { version: Zotero.version, steps: [] };
   const fixture = $fixtureJS;
   try {
-    Zotero.Prefs.set('extensions.zotero.livereload.url', fixture
-      ? 'http://127.0.0.1:18765/main.pdf' : 'http://10.253.0.9:8765/main.pdf', true);
+    LiveReload.saveURLs([fixture
+      ? 'http://127.0.0.1:18765/main.pdf' : 'http://10.253.0.9:8765/main.pdf']);
+    const source = LiveReload.previews[0];
     result.steps.push('startup');
     await LiveReload.openPreview();
     result.steps.push('download-and-open');
-    const reader = Zotero.Reader._readers.find(r => r.itemID === LiveReload.itemID);
+    const reader = Zotero.Reader._readers.find(r => r.itemID === source.itemID);
     await reader._initPromise;
     await Zotero.Promise.delay(3000);
     result.steps.push('reader-initialized');
@@ -63,7 +64,7 @@ async function runSmoke(options) {
       result.textBefore = String.fromCharCode(...oldBytes).match(/Figure 1: (OLD|NEW)/)?.[0];
       if (!result.textBefore.includes('Figure 1: OLD')) throw new Error('Expected OLD fixture');
       const imported = await Zotero.Attachments.importFromFile({
-        file: LiveReload.cachePath(), libraryID: Zotero.Libraries.userLibraryID,
+        file: source.cachePath(), libraryID: Zotero.Libraries.userLibraryID,
         title: 'Old imported PDF regression'
       });
       clickedReader = await Zotero.Reader.open(imported.id);
@@ -81,20 +82,20 @@ async function runSmoke(options) {
     let clicks = 0;
     let downloads = 0;
     let reloads = 0;
-    const request = LiveReload.request.bind(LiveReload);
-    LiveReload.request = async (method, force) => {
+    const request = source.request.bind(source);
+    source.request = async (method, force) => {
       if (method === 'GET') downloads++;
       return request(method, force);
     };
-    const reload = LiveReload.reloadReader.bind(LiveReload);
-    LiveReload.reloadReader = async (target, bytes) => { reloads++; return reload(target, bytes); };
+    const reload = source.reloadReader.bind(source);
+    source.reloadReader = async (target, bytes) => { reloads++; return reload(target, bytes); };
     control.refresh.addEventListener('click', () => clicks++);
     result.buttonDisabled = control.refresh.disabled;
     result.buttonNamespace = control.refresh.namespaceURI;
     result.toolbarButtonCount = control.root.querySelectorAll('button').length;
     result.updatedBefore = LiveReload.pref('updatedAt.' + reader.itemID, '');
     control.refresh.click();
-    if (LiveReload.busy) await LiveReload.busy;
+    if (source.busy) await source.busy;
     result.clicks = clicks;
     result.downloads = downloads;
     result.reloads = reloads;
@@ -108,7 +109,7 @@ async function runSmoke(options) {
     result.steps.push('native-reload');
     const app = reader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
     const renderedBytes = Components.utils.cloneInto(await app.pdfDocument.getData(), {});
-    const diskBytes = await IOUtils.read(LiveReload.cachePath());
+    const diskBytes = await IOUtils.read(source.cachePath());
     const remoteBytes = new Uint8Array((await request('GET', true)).response);
     const same = (left, right) => left.length === right.length && left.every((value, index) => value === right[index]);
     result.readerMatchesDisk = same(renderedBytes, diskBytes);
@@ -116,7 +117,7 @@ async function runSmoke(options) {
     if (!result.readerMatchesDisk || !result.readerMatchesServer) throw new Error('Reader is displaying stale PDF bytes');
     if (fixture) {
       result.textAfter = String.fromCharCode(...renderedBytes).match(/Figure 1: (OLD|NEW)/)?.[0];
-      result.focusedManagedPreview = Zotero.Reader.getByTabID(Zotero.getMainWindow().Zotero_Tabs.selectedID)?.itemID === LiveReload.itemID;
+      result.focusedManagedPreview = Zotero.Reader.getByTabID(Zotero.getMainWindow().Zotero_Tabs.selectedID)?.itemID === source.itemID;
       if (!result.textAfter.includes('Figure 1: NEW') || !result.focusedManagedPreview) {
         throw new Error('Managed preview did not display the NEW remote fixture');
       }
@@ -125,9 +126,9 @@ async function runSmoke(options) {
     result.renderedCanvases = app.pdfViewer._pages.filter(page => page.canvas?.width > 0).length;
     result.menu = !!Zotero.getMainWindow().document.getElementById('zotero-livereload-menu');
     result.toolbar = LiveReload.controls.size;
-    result.itemID = LiveReload.itemID;
-    result.bytes = (await IOUtils.stat(LiveReload.cachePath())).size;
-    result.status = LiveReload.status;
+    result.itemID = source.itemID;
+    result.bytes = (await IOUtils.stat(source.cachePath())).size;
+    result.status = source.status;
     result.ok = result.menu && result.toolbar > 0 && result.bytes > 0 && result.renderedCanvases > 0;
     const win = Zotero.getMainWindow();
     const tabs = win.Zotero_Tabs;
@@ -143,10 +144,32 @@ async function runSmoke(options) {
     if (!opening) throw new Error('Open menu command did not trigger');
     const restored = await opening;
     const restoredData = Components.utils.cloneInto(await restored._internalReader._primaryView._iframeWindow.PDFViewerApplication.pdfDocument.getData(), {});
-    result.unloadedTabRestored = restored.itemID === LiveReload.itemID && tabs.selectedID === restored.tabID;
+    result.unloadedTabRestored = restored.itemID === source.itemID && tabs.selectedID === restored.tabID;
     result.restoredReaderMatchesServer = same(restoredData, remoteBytes);
     if (!result.unloadedTabRestored || !result.restoredReaderMatchesServer) throw new Error('Unloaded preview was not restored and focused');
     result.steps.push('menu-restores-unloaded-tab');
+    if (fixture) {
+      LiveReload.saveURLs([source.url, 'http://127.0.0.1:18765/other.pdf']);
+      const other = LiveReload.previews[1];
+      const otherReader = await other.openPreview();
+      const otherControl = Array.from(LiveReload.controls).find(control =>
+        control.root.isConnected && control.reader === otherReader);
+      if (!otherControl || other.itemID === source.itemID || otherReader.tabID === restored.tabID) {
+        throw new Error('Expected a second preview tab with its own toolbar and attachment');
+      }
+      const otherApp = otherReader._internalReader._primaryView._iframeWindow.PDFViewerApplication;
+      const otherBytes = Components.utils.cloneInto(await otherApp.pdfDocument.getData(), {});
+      if (!String.fromCharCode(...otherBytes).includes('Figure 1: OTHER')) {
+        throw new Error('Second preview did not load its own PDF');
+      }
+      const firstDownloads = downloads;
+      otherControl.refresh.click();
+      await other.busy;
+      if (downloads !== firstDownloads || !same(otherBytes, await IOUtils.read(other.cachePath()))) {
+        throw new Error('Second preview refresh targeted a different source');
+      }
+      result.steps.push('multiple-independent-previews');
+    }
   } catch (error) {
     result.ok = false;
     result.error = String(error) + '\n' + error.stack;
@@ -183,9 +206,9 @@ try {
     $resultFile = Join-Path $results 'smoke.json'
     while ((Get-Date) -lt $deadline) {
         if ((Test-Path -LiteralPath $resultFile) -and (Get-Item -LiteralPath $resultFile).LastWriteTime -ge $startedAt) {
-            $result = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+            $result = Get-Content -LiteralPath $resultFile -Raw -Encoding UTF8 | ConvertFrom-Json
             if (!$result.ok) { throw (ConvertTo-Json $result -Depth 5) }
-            Get-Content -LiteralPath $resultFile -Raw
+            Get-Content -LiteralPath $resultFile -Raw -Encoding UTF8
             return
         }
         Start-Sleep -Milliseconds 500
